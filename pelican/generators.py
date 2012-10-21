@@ -5,6 +5,7 @@ import random
 import logging
 import datetime
 import subprocess
+import shutil
 
 from codecs import open
 from collections import defaultdict
@@ -15,9 +16,10 @@ from operator import attrgetter, itemgetter
 from jinja2 import Environment, FileSystemLoader, PrefixLoader, ChoiceLoader
 from jinja2.exceptions import TemplateNotFound
 
-from pelican.contents import Article, Page, Category, is_valid_content
+from pelican.contents import Article, Page, Category, StaticContent, \
+        is_valid_content
 from pelican.readers import read_file
-from pelican.utils import copy, process_translations
+from pelican.utils import copy, process_translations, mkdir_p
 from pelican import signals
 
 
@@ -61,6 +63,7 @@ class Generator(object):
         # get custom Jinja filters from user settings
         custom_filters = self.settings.get('JINJA_FILTERS', {})
         self.env.filters.update(custom_filters)
+        self.context['filenames'] = kwargs.get('filenames', {})
 
     def get_template(self, name):
         """Return the template by name.
@@ -80,8 +83,10 @@ class Generator(object):
 
         :param path: the path to search the file on
         :param exclude: the list of path to exclude
+        :param extensions: the list of allowed extensions (if False, all
+            extensions are allowed)
         """
-        if not extensions:
+        if extensions is None:
             extensions = self.markup
 
         files = []
@@ -95,9 +100,16 @@ class Generator(object):
             for e in exclude:
                 if e in dirs:
                     dirs.remove(e)
-            files.extend([os.sep.join((root, f)) for f in temp_files
-                if True in [f.endswith(ext) for ext in extensions]])
+            for f in temp_files:
+                if extensions is False or \
+                        (True in [f.endswith(ext) for ext in extensions]):
+                    files.append(os.sep.join((root, f)))
         return files
+
+    def add_filename(self, content):
+        location = os.path.relpath(os.path.abspath(content.filename),
+                                   os.path.abspath(self.path))
+        self.context['filenames'][location] = content
 
     def _update_context(self, items):
         """Update the context with the given items from the currrent
@@ -246,7 +258,6 @@ class ArticlesGenerator(Generator):
         self.generate_articles(write)
         self.generate_direct_templates(write)
 
-
         # and subfolders after that
         self.generate_tags(write)
         self.generate_categories(write)
@@ -254,7 +265,7 @@ class ArticlesGenerator(Generator):
         self.generate_drafts(write)
 
     def generate_context(self):
-        """change the context"""
+        """Add the articles into the shared context"""
 
         article_path = os.path.normpath(  # we have to remove trailing slashes
             os.path.join(self.path, self.settings['ARTICLE_DIR'])
@@ -272,7 +283,8 @@ class ArticlesGenerator(Generator):
             # if no category is set, use the name of the path as a category
             if 'category' not in metadata:
 
-                if os.path.dirname(f) == article_path:  # if the article is not in a subdirectory
+                # if the article is not in a subdirectory
+                if os.path.dirname(f) == article_path:
                     category = self.settings['DEFAULT_CATEGORY']
                 else:
                     category = os.path.basename(os.path.dirname(f))\
@@ -291,9 +303,11 @@ class ArticlesGenerator(Generator):
 
             signals.article_generate_context.send(self, metadata=metadata)
             article = Article(content, metadata, settings=self.settings,
-                              filename=f)
+                              filename=f, context=self.context)
             if not is_valid_content(article, f):
                 continue
+
+            self.add_filename(article)
 
             if article.status == "published":
                 if hasattr(article, 'tags'):
@@ -388,11 +402,14 @@ class PagesGenerator(Generator):
             except Exception, e:
                 logger.warning(u'Could not process %s\n%s' % (f, str(e)))
                 continue
-            signals.pages_generate_context.send(self, metadata=metadata )
+            signals.pages_generate_context.send(self, metadata=metadata)
             page = Page(content, metadata, settings=self.settings,
-                        filename=f)
+                        filename=f, context=self.context)
             if not is_valid_content(page, f):
                 continue
+
+            self.add_filename(page)
+
             if page.status == "published":
                 all_pages.append(page)
             elif page.status == "hidden":
@@ -428,6 +445,7 @@ class StaticGenerator(Generator):
                  final_path, overwrite=True)
 
     def generate_context(self):
+        self.staticfiles = []
 
         if self.settings['WEBASSETS']:
             from webassets import Environment as AssetsEnvironment
@@ -458,17 +476,29 @@ class StaticGenerator(Generator):
             if logging.getLevelName(logger.getEffectiveLevel()) == "DEBUG":
                 self.assets_env.debug = True
 
-    def generate_output(self, writer):
+        # walk static paths
+        for static_path in self.settings['STATIC_PATHS']:
+            for f in self.get_files(
+                    os.path.join(self.path, static_path), extensions=False):
+                f_rel = os.path.relpath(f, self.path)
+                sc = StaticContent(f_rel, os.path.join('static', f_rel),
+                        settings=self.settings)
+                self.staticfiles.append(sc)
+                self.context['filenames'][f_rel] = sc
+        # same thing for FILES_TO_COPY
+        for src, dest in self.settings['FILES_TO_COPY']:
+            sc = StaticContent(src, dest, settings=self.settings)
+            self.staticfiles.append(sc)
+            self.context['filenames'][src] = sc
 
-        self._copy_paths(self.settings['STATIC_PATHS'], self.path,
-                         'static', self.output_path)
+    def generate_output(self, writer):
         self._copy_paths(self.settings['THEME_STATIC_PATHS'], self.theme,
                          'theme', self.output_path, '.')
-
-        # copy all the files needed
-        for source, destination in self.settings['FILES_TO_COPY']:
-            copy(source, self.path, self.output_path, destination,
-                 overwrite=True)
+        # copy all StaticContent files
+        for sc in self.staticfiles:
+            mkdir_p(os.path.dirname(sc.save_as))
+            shutil.copy(sc.filepath, sc.save_as)
+            logger.info('copying %s to %s' % (sc.filepath, sc.save_as))
 
 
 class PdfGenerator(Generator):
@@ -511,8 +541,8 @@ class PdfGenerator(Generator):
             try:
                 os.mkdir(pdf_path)
             except OSError:
-                logger.error("Couldn't create the pdf output folder in " + pdf_path)
-                pass
+                logger.error("Couldn't create the pdf output folder in " +
+                             pdf_path)
 
         for article in self.context['articles']:
             self._create_pdf(article, pdf_path)
