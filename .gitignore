@@ -10,4 +10,5 @@ dist
 tags
 .tox
 .coverage
+.idea/*
 htmlcov
